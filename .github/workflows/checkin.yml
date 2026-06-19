@@ -1,4 +1,5 @@
 name: AnyRouter 自动签到
+# touched by Hermes to force GitHub Actions workflow indexing
 on:
   schedule:
     - cron: '0 */6 * * *'
