@@ -2,8 +2,8 @@ name: AnyRouter 自动签到
 # touched by Hermes to force GitHub Actions workflow indexing
 on:
   schedule:
-    # 避开 GitHub Actions 整点高峰；整点 cron 偶发延迟/丢弃，fork 仓库更容易不触发。
-    - cron: '17 */6 * * *'
+    # 避开 GitHub Actions 整点/半点高峰；GitHub schedule 可能延迟，fork 仓库更容易不触发。
+    - cron: '23 */6 * * *'
   workflow_dispatch:
 
 jobs:
