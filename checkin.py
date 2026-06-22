@@ -9,6 +9,7 @@ import json
 import os
 import sys
 from datetime import datetime
+from urllib.parse import urljoin, urlparse
 
 import httpx
 from dotenv import load_dotenv
@@ -63,6 +64,89 @@ def parse_cookies(cookies_data):
 				cookies_dict[key] = value
 		return cookies_dict
 	return {}
+
+
+def get_provider_hostname(provider_domain: str) -> str:
+	"""从 provider domain 提取可用于浏览器 cookie 注入的 hostname。"""
+	parsed = urlparse(provider_domain if '://' in provider_domain else f'https://{provider_domain}')
+	return parsed.hostname or provider_domain.replace('https://', '').replace('http://', '').strip('/')
+
+
+def build_playwright_cookies(cookies_data: dict, provider_domain: str) -> list[dict]:
+	"""把普通 cookie dict 转成 Playwright context.add_cookies 需要的格式。"""
+	hostname = get_provider_hostname(provider_domain)
+	secure = provider_domain.startswith('https://')
+	return [
+		{
+			'name': str(name),
+			'value': str(value),
+			'domain': hostname,
+			'path': '/',
+			'secure': secure,
+			'sameSite': 'Lax',
+		}
+		for name, value in cookies_data.items()
+		if name and value is not None
+	]
+
+
+async def trigger_browser_login_checkin(account_name: str, provider_config, user_cookies: dict) -> dict | None:
+	"""用真实浏览器登录态页面触发 AnyRouter 这类站点的每日额度发放。"""
+	paths = getattr(provider_config, 'browser_check_in_paths', None) or ['/']
+	print(f'[PROCESSING] {account_name}: Starting browser login flow to trigger daily credit...')
+
+	async with async_playwright() as p:
+		import tempfile
+
+		with tempfile.TemporaryDirectory() as temp_dir:
+			context = await p.chromium.launch_persistent_context(
+				user_data_dir=temp_dir,
+				headless=False,
+				user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36',
+				viewport={'width': 1920, 'height': 1080},
+				args=[
+					'--disable-blink-features=AutomationControlled',
+					'--disable-dev-shm-usage',
+					'--disable-web-security',
+					'--disable-features=VizDisplayCompositor',
+					'--no-sandbox',
+				],
+			)
+			try:
+				browser_cookies = build_playwright_cookies(user_cookies, provider_config.domain)
+				if browser_cookies:
+					await context.add_cookies(browser_cookies)
+
+				page = await context.new_page()
+				for path in paths:
+					url = path if str(path).startswith(('http://', 'https://')) else urljoin(f'{provider_config.domain.rstrip("/")}/', str(path).lstrip('/'))
+					print(f'[PROCESSING] {account_name}: Access logged-in page {url}')
+					try:
+						await page.goto(url, wait_until='networkidle', timeout=30000)
+					except Exception as e:
+						print(f'[WARNING] {account_name}: Browser page access did not reach networkidle - {str(e)[:80]}')
+					await page.wait_for_timeout(3000)
+
+				cookies = await context.cookies()
+				collected_cookies = {
+					cookie.get('name'): cookie.get('value')
+					for cookie in cookies
+					if cookie.get('name') and cookie.get('value') is not None
+				}
+
+				required_waf_cookies = getattr(provider_config, 'waf_cookie_names', None) or []
+				missing_cookies = [name for name in required_waf_cookies if name not in collected_cookies]
+				if missing_cookies:
+					print(f'[FAILED] {account_name}: Missing WAF cookies after browser login flow: {missing_cookies}')
+					return None
+
+				print(f'[SUCCESS] {account_name}: Browser login flow completed with {len(collected_cookies)} cookies')
+				return {**user_cookies, **collected_cookies}
+			except Exception as e:
+				print(f'[FAILED] {account_name}: Browser login flow failed - {str(e)[:80]}')
+				return None
+			finally:
+				await context.close()
 
 
 async def get_waf_cookies_with_playwright(account_name: str, login_url: str, required_cookies: list[str]):
@@ -354,7 +438,24 @@ async def check_in_account(account: AccountConfig, account_index: int, app_confi
 		elif user_info_before:
 			print(user_info_before.get('error', 'Unknown error'))
 
-		if provider_config.needs_manual_check_in():
+		if provider_config.needs_browser_check_in():
+			browser_cookies = await trigger_browser_login_checkin(account_name, provider_config, {**all_cookies, **user_cookies})
+			if not browser_cookies:
+				return False, user_info_before, None
+			client.cookies.update(browser_cookies)
+			user_info_after = get_user_info(client, headers, user_info_url)
+			success = evaluate_check_in_success(
+				api_success=True,
+				already_checked=False,
+				user_info_before=user_info_before,
+				user_info_after=user_info_after,
+			)
+			if success:
+				print(f'[SUCCESS] {account_name}: Balance increased after browser login flow')
+			else:
+				print(f'[FAILED] {account_name}: Browser login flow did not increase balance')
+			return success, user_info_before, user_info_after
+		elif provider_config.needs_manual_check_in():
 			api_success, already_checked, _message = execute_check_in(client, account_name, provider_config, headers)
 			# 签到后再次获取用户信息，用于确认余额是否真的增加
 			user_info_after = get_user_info(client, headers, user_info_url)
