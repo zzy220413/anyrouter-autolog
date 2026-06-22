@@ -21,6 +21,7 @@ class ProviderConfig:
 	api_user_key: str = 'new-api-user'
 	bypass_method: Literal['waf_cookies'] | None = None
 	waf_cookie_names: List[str] | None = None
+	browser_check_in_paths: List[str] | None = None
 
 	def __post_init__(self):
 		required_waf_cookies = set()
@@ -55,6 +56,7 @@ class ProviderConfig:
 			api_user_key=data.get('api_user_key', 'new-api-user'),
 			bypass_method=data.get('bypass_method'),
 			waf_cookie_names=data.get('waf_cookie_names'),
+			browser_check_in_paths=data.get('browser_check_in_paths'),
 		)
 
 	def needs_waf_cookies(self) -> bool:
@@ -64,6 +66,10 @@ class ProviderConfig:
 	def needs_manual_check_in(self) -> bool:
 		"""判断是否需要手动调用签到接口"""
 		return self.sign_in_path is not None
+
+	def needs_browser_check_in(self) -> bool:
+		"""判断是否需要通过真实浏览器登录态页面触发额度发放"""
+		return bool(self.browser_check_in_paths)
 
 
 @dataclass
@@ -85,6 +91,7 @@ class AppConfig:
 				api_user_key='new-api-user',
 				bypass_method='waf_cookies',
 				waf_cookie_names=['acw_tc', 'cdn_sec_tc', 'acw_sc__v2'],
+				browser_check_in_paths=['/', '/console', '/panel', '/dashboard'],
 			),
 			'agentrouter': ProviderConfig(
 				name='agentrouter',
