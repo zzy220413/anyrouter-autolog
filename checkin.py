@@ -151,6 +151,44 @@ def get_user_info(client, headers, user_info_url: str):
 		return {'success': False, 'error': f'Failed to get user info: {str(e)[:50]}...'}
 
 
+ALREADY_CHECKED_KEYWORDS = ('已经签到', '已签到', '重复签到', 'already checked', 'already signed')
+
+
+def is_already_checked_message(message: str | None) -> bool:
+	"""判断接口返回是否明确表示今天已签到过。"""
+	if not message:
+		return False
+	message_lower = message.lower()
+	return any(keyword in message_lower for keyword in ALREADY_CHECKED_KEYWORDS)
+
+
+def evaluate_check_in_success(
+	*,
+	api_success: bool,
+	already_checked: bool,
+	user_info_before: dict | None,
+	user_info_after: dict | None,
+) -> bool:
+	"""判断本次软件签到是否真正成功。
+
+	接口返回成功但余额没有增加时，不算有效签到；只有接口明确表示
+	"今天已签到过"时，才允许余额无变化但视为成功。
+	"""
+	if already_checked:
+		return True
+
+	if not api_success:
+		return False
+
+	if not user_info_before or not user_info_after:
+		return False
+
+	if not user_info_before.get('success') or not user_info_after.get('success'):
+		return False
+
+	return float(user_info_after.get('quota', 0)) > float(user_info_before.get('quota', 0))
+
+
 async def prepare_cookies(account_name: str, provider_config, user_cookies: dict) -> dict | None:
 	"""准备请求所需的 cookies（可能包含 WAF cookies）"""
 	waf_cookies = {}
@@ -168,7 +206,11 @@ async def prepare_cookies(account_name: str, provider_config, user_cookies: dict
 
 
 def execute_check_in(client, account_name: str, provider_config, headers: dict):
-	"""执行签到请求"""
+	"""执行签到请求
+
+	Returns:
+		(api_success, already_checked, message)
+	"""
 	print(f'[NETWORK] {account_name}: Executing check-in')
 
 	checkin_headers = headers.copy()
@@ -182,29 +224,38 @@ def execute_check_in(client, account_name: str, provider_config, headers: dict):
 	if response.status_code == 200:
 		try:
 			result = response.json()
+			message = str(result.get('msg', result.get('message', '')))
+			already_checked = is_already_checked_message(message)
 			if result.get('ret') == 1 or result.get('code') == 0 or result.get('success'):
-				print(f'[SUCCESS] {account_name}: Check-in successful!')
-				return True
-			else:
-				error_msg = result.get('msg', result.get('message', 'Unknown error'))
-				# 检查是否是"已经签到过"的情况，这种情况也算成功
-				already_checked_keywords = ['已经签到', '已签到', '重复签到', 'already checked', 'already signed']
-				if any(keyword in error_msg.lower() for keyword in already_checked_keywords):
+				if already_checked:
 					print(f'[SUCCESS] {account_name}: Already checked in today')
-					return True
-				print(f'[FAILED] {account_name}: Check-in failed - {error_msg}')
-				return False
+				else:
+					print(f'[SUCCESS] {account_name}: Check-in API returned success')
+				return True, already_checked, message
+			else:
+				# 检查是否是"已经签到过"的情况，这种情况也算成功
+				if already_checked:
+					print(f'[SUCCESS] {account_name}: Already checked in today')
+					return True, True, message
+				print(f'[FAILED] {account_name}: Check-in failed - {message or "Unknown error"}')
+				return False, False, message
 		except json.JSONDecodeError:
 			# 如果不是 JSON 响应，检查是否包含成功标识
+			response_text = response.text[:500]
+			already_checked = is_already_checked_message(response.text)
+			if already_checked:
+				print(f'[SUCCESS] {account_name}: Already checked in today')
+				return True, True, response_text
 			if 'success' in response.text.lower():
-				print(f'[SUCCESS] {account_name}: Check-in successful!')
-				return True
+				print(f'[SUCCESS] {account_name}: Check-in API returned success')
+				return True, False, response_text
 			else:
 				print(f'[FAILED] {account_name}: Check-in failed - Invalid response format')
-				return False
+				return False, False, response_text
 	else:
-		print(f'[FAILED] {account_name}: Check-in failed - HTTP {response.status_code}')
-		return False
+		message = f'HTTP {response.status_code}'
+		print(f'[FAILED] {account_name}: Check-in failed - {message}')
+		return False, False, message
 
 
 def format_check_in_notification(detail: dict) -> str:
@@ -264,18 +315,18 @@ async def check_in_account(account: AccountConfig, account_index: int, app_confi
 	provider_config = app_config.get_provider(account.provider)
 	if not provider_config:
 		print(f'[FAILED] {account_name}: Provider "{account.provider}" not found in configuration')
-		return False, None
+		return False, None, None
 
 	print(f'[INFO] {account_name}: Using provider "{account.provider}" ({provider_config.domain})')
 
 	user_cookies = parse_cookies(account.cookies)
 	if not user_cookies:
 		print(f'[FAILED] {account_name}: Invalid configuration format')
-		return False, None
+		return False, None, None
 
 	all_cookies = await prepare_cookies(account_name, provider_config, user_cookies)
 	if not all_cookies:
-		return False, None
+		return False, None, None
 
 	client = httpx.Client(http2=True, timeout=30.0)
 
@@ -304,15 +355,35 @@ async def check_in_account(account: AccountConfig, account_index: int, app_confi
 			print(user_info_before.get('error', 'Unknown error'))
 
 		if provider_config.needs_manual_check_in():
-			success = execute_check_in(client, account_name, provider_config, headers)
-			# 签到后再次获取用户信息，用于计算签到收益
+			api_success, already_checked, _message = execute_check_in(client, account_name, provider_config, headers)
+			# 签到后再次获取用户信息，用于确认余额是否真的增加
 			user_info_after = get_user_info(client, headers, user_info_url)
+			success = evaluate_check_in_success(
+				api_success=api_success,
+				already_checked=already_checked,
+				user_info_before=user_info_before,
+				user_info_after=user_info_after,
+			)
+			if success and not already_checked:
+				print(f'[SUCCESS] {account_name}: Balance increased after check-in')
+			elif not success and api_success:
+				print(f'[FAILED] {account_name}: Check-in API returned success but balance did not increase')
 			return success, user_info_before, user_info_after
 		else:
-			print(f'[INFO] {account_name}: Check-in completed automatically (triggered by user info request)')
-			# 自动签到的情况，再次获取用户信息
+			print(f'[INFO] {account_name}: Check-in may be triggered automatically by user info request')
+			# 自动签到的情况，再次获取用户信息；只有余额增加才算本次软件签到成功
 			user_info_after = get_user_info(client, headers, user_info_url)
-			return True, user_info_before, user_info_after
+			success = evaluate_check_in_success(
+				api_success=True,
+				already_checked=False,
+				user_info_before=user_info_before,
+				user_info_after=user_info_after,
+			)
+			if success:
+				print(f'[SUCCESS] {account_name}: Balance increased after automatic check-in')
+			else:
+				print(f'[FAILED] {account_name}: Automatic check-in did not increase balance')
+			return success, user_info_before, user_info_after
 
 	except Exception as e:
 		print(f'[FAILED] {account_name}: Error occurred during check-in process - {str(e)[:50]}...')
