@@ -145,7 +145,6 @@ class NotificationKit:
 			('Feishu', lambda: self.send_feishu(title, content)),
 			('WeChat Work', lambda: self.send_wecom(title, content)),
 			('Gotify', lambda: self.send_gotify(title, content)),
-			('Telegram', lambda: self.send_telegram(title, content)),
 			('Bark', lambda: self.send_bark(title, content)),
 		]
 
